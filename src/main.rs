@@ -29,12 +29,7 @@ impl WasmRuntime {
         let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
         add_to_linker_sync(&mut linker, |cx| cx)?;
 
-        Ok(Self {
-            engine,
-            linker,
-            dir: dir.as_ref().to_path_buf(),
-            modules: Mutex::new(HashMap::new()),
-        })
+        Ok(Self { engine, linker, dir: dir.as_ref().to_path_buf(), modules: Mutex::new(HashMap::new()) })
     }
 
     pub fn objects(&self) -> Result<Vec<String>> {
@@ -44,9 +39,10 @@ impl WasmRuntime {
             if entry.file_type()?.is_file() {
                 let p = entry.path();
                 if p.extension().and_then(|s| s.to_str()) == Some("wasm")
-                    && let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                        ids.push(stem.to_string());
-                    }
+                    && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+                {
+                    ids.push(stem.to_string());
+                }
             }
         }
         ids.sort();
@@ -59,12 +55,8 @@ impl WasmRuntime {
         }
         // Load + compile, cache
         let path = self.dir.join(format!("{id}.wasm"));
-        let module =
-            Module::from_file(&self.engine, &path).with_context(|| format!("loading {path:?}"))?;
-        self.modules
-            .lock()
-            .unwrap()
-            .insert(id.to_string(), module.clone());
+        let module = Module::from_file(&self.engine, &path).with_context(|| format!("loading {path:?}"))?;
+        self.modules.lock().unwrap().insert(id.to_string(), module.clone());
         Ok(module)
     }
 
@@ -72,24 +64,16 @@ impl WasmRuntime {
         let module = self.get_or_load_module(id)?;
 
         // JSON-in on stdin; JSON-out on stdout
-        let input = json!({ "opts": opts, "args": args })
-            .to_string()
-            .into_bytes();
+        let input = json!({ "opts": opts, "args": args }).to_string().into_bytes();
         let stdin = MemoryInputPipe::new(input);
         let stdout = MemoryOutputPipe::new(64 * 1024);
         let stderr = MemoryOutputPipe::new(64 * 1024);
 
-        let wasi = WasiCtxBuilder::new()
-            .stdin(stdin)
-            .stdout(stdout.clone())
-            .stderr(stderr.clone())
-            .build_p1();
+        let wasi = WasiCtxBuilder::new().stdin(stdin).stdout(stdout.clone()).stderr(stderr.clone()).build_p1();
 
         let mut store: Store<WasiP1Ctx> = Store::new(&self.engine, wasi);
         let instance = self.linker.instantiate(&mut store, &module)?;
-        let start = instance
-            .get_typed_func::<(), ()>(&mut store, "_start")
-            .context("module missing _start")?;
+        let start = instance.get_typed_func::<(), ()>(&mut store, "_start").context("module missing _start")?;
         match start.call(&mut store, ()) {
             Ok(()) => {}
             Err(e) => {
@@ -111,8 +95,7 @@ impl WasmRuntime {
         let val: Value = if text.trim().is_empty() {
             json!(null)
         } else {
-            serde_json::from_str(&text)
-                .with_context(|| format!("stdout was not valid JSON:\n{text}"))?
+            serde_json::from_str(&text).with_context(|| format!("stdout was not valid JSON:\n{text}"))?
         };
 
         let err_bytes = stderr.contents();
@@ -134,12 +117,7 @@ fn main() -> anyhow::Result<()> {
 
     // demo inputs
     let opts = vec!["--demo".into(), "fast".into()];
-    let args: HashMap<_, _> = [
-        ("msg".to_string(), json!("hi from host")),
-        ("n".to_string(), json!(3)),
-    ]
-    .into_iter()
-    .collect();
+    let args: HashMap<_, _> = [("msg".to_string(), json!("hi from host")), ("n".to_string(), json!(3))].into_iter().collect();
 
     // run the first id
     for id in &ids {
