@@ -6,8 +6,9 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.99"
 serde_json = { version = "1.0.145", features = ["indexmap"] }
+tokio = { version = "1.47.1", features = ["full"] }
 wasi-common = "36.0.2"
-wasmtime = "36.0.2"
+wasmtime = { version = "36.0.2", features = ["async"] }
 wasmtime-wasi = "36.0.2"
 
 [profile.release]
