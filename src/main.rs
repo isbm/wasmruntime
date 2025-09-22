@@ -1,11 +1,14 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
-use wasmtime::{Engine, Linker, Module, Store};
+use wasi_common::I32Exit as CoreI32Exit;
+use wasmtime::{Config, Engine, Linker, Module, Store};
+use wasmtime_wasi::I32Exit as WasiI32Exit;
 use wasmtime_wasi::{WasiCtxBuilder, p2::pipe::MemoryInputPipe};
 use wasmtime_wasi::{
     p2::pipe::MemoryOutputPipe,
@@ -15,13 +18,22 @@ use wasmtime_wasi::{
 pub struct WasmRuntime {
     engine: Engine,
     dir: PathBuf,
+    linker: Linker<WasiP1Ctx>,
+    modules: Mutex<HashMap<String, Module>>,
 }
 
 impl WasmRuntime {
     pub fn new<P: AsRef<Path>>(dir: P) -> Result<Self> {
+        let cfg = Config::new();
+        let engine = Engine::new(&cfg)?;
+        let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
+        add_to_linker_sync(&mut linker, |cx| cx)?;
+
         Ok(Self {
-            engine: Engine::default(),
+            engine,
+            linker,
             dir: dir.as_ref().to_path_buf(),
+            modules: Mutex::new(HashMap::new()),
         })
     }
 
@@ -31,23 +43,35 @@ impl WasmRuntime {
             let entry = entry?;
             if entry.file_type()?.is_file() {
                 let p = entry.path();
-                if p.extension().and_then(|s| s.to_str()) == Some("wasm") {
-                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                if p.extension().and_then(|s| s.to_str()) == Some("wasm")
+                    && let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
                         ids.push(stem.to_string());
                     }
-                }
             }
         }
         ids.sort();
         Ok(ids)
     }
 
-    pub fn run(&self, id: &str, opts: Vec<String>, args: HashMap<String, Value>) -> Result<Value> {
+    fn get_or_load_module(&self, id: &str) -> Result<Module> {
+        if let Some(m) = self.modules.lock().unwrap().get(id).cloned() {
+            return Ok(m);
+        }
+        // Load + compile, cache
         let path = self.dir.join(format!("{id}.wasm"));
         let module =
             Module::from_file(&self.engine, &path).with_context(|| format!("loading {path:?}"))?;
+        self.modules
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), module.clone());
+        Ok(module)
+    }
 
-        // JSON in on stdin, JSON out on stdout
+    pub fn run(&self, id: &str, opts: Vec<String>, args: HashMap<String, Value>) -> Result<Value> {
+        let module = self.get_or_load_module(id)?;
+
+        // JSON-in on stdin; JSON-out on stdout
         let input = json!({ "opts": opts, "args": args })
             .to_string()
             .into_bytes();
@@ -55,7 +79,6 @@ impl WasmRuntime {
         let stdout = MemoryOutputPipe::new(64 * 1024);
         let stderr = MemoryOutputPipe::new(64 * 1024);
 
-        // Build WASI (preview1) context
         let wasi = WasiCtxBuilder::new()
             .stdin(stdin)
             .stdout(stdout.clone())
@@ -63,19 +86,28 @@ impl WasmRuntime {
             .build_p1();
 
         let mut store: Store<WasiP1Ctx> = Store::new(&self.engine, wasi);
-        let mut linker: Linker<WasiP1Ctx> = Linker::new(&self.engine);
-        add_to_linker_sync(&mut linker, |cx| cx)?;
-
-        // Instantiate + call `_start`
-        let instance = linker.instantiate(&mut store, &module)?;
+        let instance = self.linker.instantiate(&mut store, &module)?;
         let start = instance
             .get_typed_func::<(), ()>(&mut store, "_start")
-            .context("module missing _start (not a WASI command)?")?;
-        start.call(&mut store, ())?;
-
-        // Collect stdout as JSON
-        let out_bytes = stdout.contents();
-        let text = String::from_utf8(out_bytes.to_vec())?;
+            .context("module missing _start")?;
+        match start.call(&mut store, ()) {
+            Ok(()) => {}
+            Err(e) => {
+                // Accept proc_exit(0) as success (both possible I32Exit types)
+                if let Some(exit) = e.downcast_ref::<WasiI32Exit>() {
+                    if exit.0 != 0 {
+                        bail!("module exited with status {}", exit.0);
+                    }
+                } else if let Some(exit) = e.downcast_ref::<CoreI32Exit>() {
+                    if exit.0 != 0 {
+                        bail!("module exited with status {}", exit.0);
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+        let text = String::from_utf8(stdout.contents().to_vec())?;
         let val: Value = if text.trim().is_empty() {
             json!(null)
         } else {
@@ -87,10 +119,10 @@ impl WasmRuntime {
         if !err_bytes.is_empty() {
             eprintln!("guest stderr:\n{}", String::from_utf8_lossy(&err_bytes));
         }
-
         Ok(val)
     }
 }
+
 fn main() -> anyhow::Result<()> {
     let rt = WasmRuntime::new("./wasm_bins")?;
     let ids = rt.objects()?;
@@ -110,9 +142,11 @@ fn main() -> anyhow::Result<()> {
     .collect();
 
     // run the first id
-    let id = &ids[0];
-    let out = rt.run(id, opts, args)?;
-    println!("{} -> {}", id, out);
+    for id in &ids {
+        println!("running {id}...");
+        let out = rt.run(id, opts.clone(), args.clone())?;
+        println!("{} -> {}", id, out);
+    }
 
     Ok(())
 }

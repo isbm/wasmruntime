@@ -1,0 +1,3 @@
+module Main
+
+print("{\"ok\":true,\"msg\":\"hello world from Grain language!\"}")
