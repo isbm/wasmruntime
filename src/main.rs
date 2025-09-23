@@ -1,13 +1,18 @@
 use serde_json::json;
 use std::collections::HashMap;
-use wasmruntime::WasmRuntime;
+use wasmruntime::{WasmRuntime, cfg::WasmConfig};
 
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
-    let rt = WasmRuntime::new("./wasm_bins")?;
+    let mut cfg = WasmConfig::default();
+    cfg.set_rootdir("./wasm_bins");
+    cfg.set_host_path("/tmp/wasm-playground")?;
+    cfg.set_allow_write(true);
+
+    let rt = WasmRuntime::new(cfg)?;
     let ids = rt.objects()?;
     if ids.is_empty() {
-        println!("no .wasm found in ./wasm_bins — put one there, e.g. wasm_bins/echo.wasm");
+        println!("no .wasm files found in ./wasm_bins — put one there, e.g. wasm_bins/echo.wasm");
         return Ok(());
     }
     println!("found: {ids:?}");
