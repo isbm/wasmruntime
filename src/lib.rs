@@ -29,7 +29,7 @@ impl WasmRuntime {
 
     pub fn objects(&self) -> Result<Vec<String>> {
         let mut ids = Vec::new();
-        for entry in fs::read_dir(&self.cfg.get_root_path())? {
+        for entry in fs::read_dir(self.cfg.get_root_path())? {
             let entry = entry?;
             if entry.file_type()?.is_file() {
                 let p = entry.path();
