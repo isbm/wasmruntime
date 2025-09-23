@@ -1,38 +1,35 @@
+use crate::cfg::WasmConfig;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::{
-    collections::HashMap,
-    fs,
-    path::{Path, PathBuf},
-    sync::Mutex,
-};
+use std::{collections::HashMap, fs, sync::Mutex};
 use wasi_common::I32Exit as CoreI32Exit;
 use wasmtime::{Config, Engine, Linker, Module, Store};
 use wasmtime_wasi::{I32Exit as WasiI32Exit, preview1::add_to_linker_async};
 use wasmtime_wasi::{WasiCtxBuilder, p2::pipe::MemoryInputPipe};
 use wasmtime_wasi::{p2::pipe::MemoryOutputPipe, preview1::WasiP1Ctx};
 
+pub mod cfg;
 pub struct WasmRuntime {
     engine: Engine,
-    dir: PathBuf,
+    cfg: WasmConfig,
     linker: Linker<WasiP1Ctx>,
     modules: Mutex<HashMap<String, Module>>,
 }
 
 impl WasmRuntime {
-    pub fn new<P: AsRef<Path>>(dir: P) -> Result<Self> {
+    pub fn new(wcfg: WasmConfig) -> Result<Self> {
         let mut cfg = Config::new();
         cfg.async_support(true);
         let engine = Engine::new(&cfg)?;
         let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
         add_to_linker_async(&mut linker, |cx| cx)?;
 
-        Ok(Self { engine, linker, dir: dir.as_ref().to_path_buf(), modules: Mutex::new(HashMap::new()) })
+        Ok(Self { engine, linker, cfg: wcfg, modules: Mutex::new(HashMap::new()) })
     }
 
     pub fn objects(&self) -> Result<Vec<String>> {
         let mut ids = Vec::new();
-        for entry in fs::read_dir(&self.dir)? {
+        for entry in fs::read_dir(&self.cfg.get_root_path())? {
             let entry = entry?;
             if entry.file_type()?.is_file() {
                 let p = entry.path();
@@ -52,7 +49,7 @@ impl WasmRuntime {
             return Ok(m);
         }
         // Load + compile, cache
-        let path = self.dir.join(format!("{id}.wasm"));
+        let path = self.cfg.get_root_path().join(format!("{id}.wasm"));
         let module = Module::from_file(&self.engine, &path).with_context(|| format!("loading {path:?}"))?;
         self.modules.lock().unwrap().insert(id.to_string(), module.clone());
         Ok(module)
@@ -67,7 +64,22 @@ impl WasmRuntime {
         let stdout = MemoryOutputPipe::new(64 * 1024);
         let stderr = MemoryOutputPipe::new(64 * 1024);
 
-        let wasi = WasiCtxBuilder::new().stdin(stdin).stdout(stdout.clone()).stderr(stderr.clone()).build_p1();
+        let mut wb = WasiCtxBuilder::new();
+        let mut wb = wb
+            .stdin(stdin)
+            .stdout(stdout.clone())
+            .stderr(stderr.clone())
+            .allow_tcp(self.cfg.get_allow_network())
+            .allow_udp(self.cfg.get_allow_network());
+
+        if self.cfg.get_allow_write() {
+            if fs::metadata(self.cfg.get_host_path()).is_err() {
+                fs::create_dir_all(self.cfg.get_host_path()).with_context(|| format!("creating host path {:?}", self.cfg.get_host_path()))?;
+            }
+            wb = wb.preopened_dir(self.cfg.get_host_path(), self.cfg.get_guest_path(), self.cfg.get_dir_perms(), self.cfg.get_file_perms())?;
+        }
+
+        let wasi = wb.build_p1();
 
         let mut store: Store<WasiP1Ctx> = Store::new(&self.engine, wasi);
         let instance = self.linker.instantiate_async(&mut store, &module).await?;
