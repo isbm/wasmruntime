@@ -1,12 +1,14 @@
 use crate::cfg::WasmConfig;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::{collections::HashMap, fs, sync::Mutex};
+use std::collections::HashMap;
+use std::{fs, sync::Mutex};
 use wasi_common::I32Exit as CoreI32Exit;
 use wasmtime::{Config, Engine, Linker, Module, Store};
+use wasmtime_wasi::WasiCtxBuilder;
+use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
+use wasmtime_wasi::preview1::WasiP1Ctx;
 use wasmtime_wasi::{I32Exit as WasiI32Exit, preview1::add_to_linker_async};
-use wasmtime_wasi::{WasiCtxBuilder, p2::pipe::MemoryInputPipe};
-use wasmtime_wasi::{p2::pipe::MemoryOutputPipe, preview1::WasiP1Ctx};
 
 pub mod cfg;
 pub struct WasmRuntime {
@@ -55,16 +57,18 @@ impl WasmRuntime {
         Ok(module)
     }
 
-    pub async fn run(&self, id: &str, opts: Vec<String>, args: HashMap<String, Value>) -> Result<Value> {
+    pub async fn run(&self, id: &str, opts: Vec<String>, args: HashMap<String, Value>, data: Vec<u8>) -> Result<(Value)> {
         let module = self.get_or_load_module(id)?;
+        let mut input = serde_json::json!({ "opts": opts, "args": args }).to_string().into_bytes();
+        input.push(b'\n');
 
-        // JSON-in on stdin; JSON-out on stdout
-        let input = json!({ "opts": opts, "args": args }).to_string().into_bytes();
+        input.extend_from_slice(&data);
+
         let stdin = MemoryInputPipe::new(input);
         let stdout = MemoryOutputPipe::new(64 * 1024);
         let stderr = MemoryOutputPipe::new(64 * 1024);
 
-        let mut wb = WasiCtxBuilder::new();
+        let mut wb = wasmtime_wasi::WasiCtxBuilder::new();
         let mut wb = wb
             .stdin(stdin)
             .stdout(stdout.clone())
@@ -73,44 +77,44 @@ impl WasmRuntime {
             .allow_udp(self.cfg.get_allow_network());
 
         if self.cfg.get_allow_write() {
-            if fs::metadata(self.cfg.get_host_path()).is_err() {
-                fs::create_dir_all(self.cfg.get_host_path()).with_context(|| format!("creating host path {:?}", self.cfg.get_host_path()))?;
+            if std::fs::metadata(self.cfg.get_host_path()).is_err() {
+                std::fs::create_dir_all(self.cfg.get_host_path()).with_context(|| format!("creating host path {:?}", self.cfg.get_host_path()))?;
             }
             wb = wb.preopened_dir(self.cfg.get_host_path(), self.cfg.get_guest_path(), self.cfg.get_dir_perms(), self.cfg.get_file_perms())?;
         }
 
         let wasi = wb.build_p1();
-
-        let mut store: Store<WasiP1Ctx> = Store::new(&self.engine, wasi);
+        let mut store: Store<wasmtime_wasi::preview1::WasiP1Ctx> = Store::new(&self.engine, wasi);
         let instance = self.linker.instantiate_async(&mut store, &module).await?;
         let start = instance.get_typed_func::<(), ()>(&mut store, "_start").context("module missing _start")?;
+
         match start.call_async(&mut store, ()).await {
             Ok(()) => {}
             Err(e) => {
-                // Accept proc_exit(0) as success (both possible I32Exit types)
-                if let Some(exit) = e.downcast_ref::<WasiI32Exit>() {
+                if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
                     if exit.0 != 0 {
-                        bail!("module exited with status {}", exit.0);
+                        anyhow::bail!("module exited with status {}", exit.0);
                     }
-                } else if let Some(exit) = e.downcast_ref::<CoreI32Exit>() {
+                } else if let Some(exit) = e.downcast_ref::<wasi_common::I32Exit>() {
                     if exit.0 != 0 {
-                        bail!("module exited with status {}", exit.0);
+                        anyhow::bail!("module exited with status {}", exit.0);
                     }
                 } else {
                     return Err(e);
                 }
             }
         }
+
         let text = String::from_utf8(stdout.contents().to_vec())?;
-        let val: Value = if text.trim().is_empty() {
-            json!(null)
+        let val = if text.trim().is_empty() {
+            serde_json::json!(null)
         } else {
             serde_json::from_str(&text).with_context(|| format!("stdout was not valid JSON:\n{text}"))?
         };
 
-        let err_bytes = stderr.contents();
-        if !err_bytes.is_empty() {
-            eprintln!("guest stderr:\n{}", String::from_utf8_lossy(&err_bytes));
+        let err = stderr.contents();
+        if !err.is_empty() {
+            eprintln!("guest stderr:\n{}", String::from_utf8_lossy(&err));
         }
         Ok(val)
     }

@@ -24,7 +24,7 @@ pub async fn main() -> anyhow::Result<()> {
     // run the first id
     for id in &ids {
         println!("running {id}...");
-        let out = rt.run(id, opts.clone(), args.clone()).await?;
+        let out = rt.run(id, opts.clone(), args.clone(), Vec::new()).await?;
         println!("{} -> {}", id, out);
     }
 
