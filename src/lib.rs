@@ -1,14 +1,12 @@
 use crate::cfg::WasmConfig;
-use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use anyhow::{Context, Result};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::{fs, sync::Mutex};
-use wasi_common::I32Exit as CoreI32Exit;
 use wasmtime::{Config, Engine, Linker, Module, Store};
-use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::preview1::WasiP1Ctx;
-use wasmtime_wasi::{I32Exit as WasiI32Exit, preview1::add_to_linker_async};
+use wasmtime_wasi::preview1::add_to_linker_async;
 
 pub mod cfg;
 pub struct WasmRuntime {
@@ -57,7 +55,7 @@ impl WasmRuntime {
         Ok(module)
     }
 
-    pub async fn run(&self, id: &str, opts: Vec<String>, args: HashMap<String, Value>, data: Vec<u8>) -> Result<(Value)> {
+    pub async fn run(&self, id: &str, opts: Vec<String>, args: HashMap<String, Value>, data: Vec<u8>) -> Result<Value> {
         let module = self.get_or_load_module(id)?;
         let mut input = serde_json::json!({ "opts": opts, "args": args }).to_string().into_bytes();
         input.push(b'\n');
