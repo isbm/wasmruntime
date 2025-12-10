@@ -2,6 +2,7 @@ use crate::cfg::WasmConfig;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::{fs, sync::Mutex};
 use wasmtime::{Config, Engine, Linker, Module, Store};
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
@@ -44,22 +45,75 @@ impl WasmRuntime {
         Ok(ids)
     }
 
-    fn get_or_load_module(&self, id: &str) -> Result<Module> {
+    /// Precompile `<id>.wasm` into `<id>.cwasm` using this host's Engine.
+    pub fn precompile_module(&self, id: &str) -> Result<()> {
+        let root = self.cfg.get_root_path();
+        let wasm_path: PathBuf = root.join(format!("{id}.wasm"));
+        let cwasm_path: PathBuf = root.join(format!("{id}.cwasm"));
+
+        let wasm_bytes = std::fs::read(&wasm_path).with_context(|| format!("reading wasm file {wasm_path:?} for module '{id}'"))?;
+        let compiled_bytes = self.engine.precompile_module(&wasm_bytes).with_context(|| format!("precompiling module '{id}' from {wasm_path:?}"))?;
+
+        if let Some(parent) = cwasm_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| format!("creating directory {parent:?} for cwasm output"))?;
+        }
+
+        std::fs::write(&cwasm_path, &compiled_bytes).with_context(|| format!("writing precompiled module to {cwasm_path:?}"))?;
+
+        Ok(())
+    }
+
+    pub fn get_or_load_module(&self, id: &str) -> Result<Module> {
         if let Some(m) = self.modules.lock().unwrap().get(id).cloned() {
             return Ok(m);
         }
-        // Load + compile, cache
-        let path = self.cfg.get_root_path().join(format!("{id}.wasm"));
-        let module = Module::from_file(&self.engine, &path).with_context(|| format!("loading {path:?}"))?;
+
+        let root = self.cfg.get_root_path();
+        let cwasm_path = root.join(format!("{id}.cwasm"));
+
+        // Precompile if .cwasm missing
+        if !cwasm_path.exists() {
+            self.precompile_module(id)?;
+        }
+
+        // Try to load .cwasm
+        let first_attempt = unsafe { Module::deserialize_file(&self.engine, &cwasm_path) };
+        let module = match first_attempt {
+            Ok(module) => module,
+            Err(err1) => {
+                eprintln!(
+                    "Failed to deserialize precompiled module {:?} (first attempt):\n{:#}\n\
+                     Assuming it was precompiled with a different engine. Refreshing cwasm binary.",
+                    cwasm_path, err1
+                );
+
+                let _ = std::fs::remove_file(&cwasm_path);
+                self.precompile_module(id)?;
+
+                match unsafe { Module::deserialize_file(&self.engine, &cwasm_path) } {
+                    Ok(module) => module,
+                    Err(err2) => {
+                        // At this point something is really wrong (FS, engine, etc.)
+                        return Err(anyhow::anyhow!(
+                            "Failed to deserialize precompiled module {cwasm_path:?} even \
+                             after deleting and recompiling.\nFirst error:\n{err1:#}\n\n\
+                             Second error:\n{err2:#}"
+                        ));
+                    }
+                }
+            }
+        };
+
         self.modules.lock().unwrap().insert(id.to_string(), module.clone());
+
         Ok(module)
     }
 
     pub async fn run(&self, id: &str, opts: Vec<String>, args: HashMap<String, Value>, data: Vec<u8>) -> Result<Value> {
         let module = self.get_or_load_module(id)?;
         let mut input = serde_json::json!({ "opts": opts, "args": args }).to_string().into_bytes();
-        input.push(b'\n');
 
+        input.push(b'\n');
         input.extend_from_slice(&data);
 
         let stdin = MemoryInputPipe::new(input);
