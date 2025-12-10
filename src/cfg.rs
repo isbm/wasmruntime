@@ -34,7 +34,7 @@ impl Default for WasmConfig {
     fn default() -> Self {
         Self {
             host_path: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            guest_path: ".".to_string(),
+            guest_path: "/".to_string(),
             dir_perms: DirPerms::all(),
             file_perms: FilePerms::all(),
             rootdir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
