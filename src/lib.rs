@@ -21,6 +21,8 @@ impl WasmRuntime {
     pub fn new(wcfg: WasmConfig) -> Result<Self> {
         let mut cfg = Config::new();
         cfg.async_support(true);
+        cfg.cranelift_opt_level(wasmtime::OptLevel::SpeedAndSize);
+
         let engine = Engine::new(&cfg)?;
         let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
         add_to_linker_async(&mut linker, |cx| cx)?;
