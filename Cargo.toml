@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.99"
+chrono = "0.4.43"
 serde = "1.0.228"
 serde_json = { version = "1.0.145", features = ["indexmap"] }
 tokio = { version = "1.47.1", features = ["full"] }
