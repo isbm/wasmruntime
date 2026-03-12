@@ -7,28 +7,32 @@ use std::{
 use wasmtime::{Caller, Extern, Linker, Memory};
 use wasmtime_wasi::preview1::WasiP1Ctx;
 
-static API_NAMESPACE: &str = "api";
+pub const API_NAMESPACE: &str = "api";
 
-pub(crate) struct HostState {
+pub struct HostState {
     wasi: WasiP1Ctx,
     logs: Arc<Mutex<Vec<String>>>,
     module: String,
 }
 
 impl HostState {
-    pub(crate) fn new(wasi: WasiP1Ctx, logs: Arc<Mutex<Vec<String>>>, module: String) -> Self {
+    pub fn new(wasi: WasiP1Ctx, logs: Arc<Mutex<Vec<String>>>, module: String) -> Self {
         Self { wasi, logs, module }
     }
 
-    pub(crate) fn wasi(&mut self) -> &mut WasiP1Ctx {
+    pub fn wasi(&mut self) -> &mut WasiP1Ctx {
         &mut self.wasi
     }
 
-    pub(crate) fn logs(&self) -> Vec<String> {
+    pub fn logs(&self) -> Vec<String> {
         match self.logs.lock() {
             Ok(mut g) => std::mem::take(&mut *g),
             Err(_) => Vec::new(),
         }
+    }
+
+    pub fn module(&self) -> &str {
+        &self.module
     }
 }
 
@@ -38,10 +42,44 @@ struct ExecReq {
     argv: Vec<String>,
     #[serde(default)]
     cwd: Option<String>,
-    // later: env: HashMap<String,String>, stdin, etc.
 }
 
-pub(crate) fn fn_api_log(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
+fn write_bytes(mem: &Memory, caller: &mut Caller<'_, HostState>, out_ptr: usize, out_cap: usize, bytes: &[u8]) -> i32 {
+    let n = bytes.len().min(out_cap);
+    let data_mut = mem.data_mut(caller);
+    data_mut[out_ptr..out_ptr + n].copy_from_slice(&bytes[..n]);
+    n as i32
+}
+
+pub fn write_json(mem: &Memory, caller: &mut Caller<'_, HostState>, out_ptr: usize, out_cap: usize, value: &serde_json::Value) -> i32 {
+    write_bytes(mem, caller, out_ptr, out_cap, &serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec()))
+}
+
+pub fn write_error(mem: &Memory, caller: &mut Caller<'_, HostState>, out_ptr: usize, out_cap: usize, msg: &str) -> i32 {
+    write_json(mem, caller, out_ptr, out_cap, &serde_json::json!({ "error": msg }))
+}
+
+pub fn output_region(caller: &Caller<'_, HostState>, mem: &Memory, out_ptr: i32, out_cap: i32) -> Option<(usize, usize)> {
+    if out_ptr < 0 || out_cap <= 0 {
+        return None;
+    }
+    let (out_ptr, out_cap) = (out_ptr as usize, out_cap as usize);
+    let data = mem.data(caller);
+    let out_end = out_ptr.checked_add(out_cap)?;
+    (out_end <= data.len()).then_some((out_ptr, out_cap))
+}
+
+pub fn request_bytes<'a>(caller: &'a Caller<'_, HostState>, mem: &'a Memory, req_ptr: i32, req_len: i32) -> Option<&'a [u8]> {
+    if req_ptr < 0 || req_len <= 0 {
+        return None;
+    }
+    let (req_ptr, req_len) = (req_ptr as usize, req_len as usize);
+    let data = mem.data(caller);
+    let req_end = req_ptr.checked_add(req_len)?;
+    (req_end <= data.len()).then_some(&data[req_ptr..req_end])
+}
+
+pub fn fn_api_log(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     linker.func_wrap("api", "log", |mut caller: Caller<'_, HostState>, level: i32, msg_ptr: i32, msg_len: i32| {
         let mem = match caller.get_export("memory") {
             Some(Extern::Memory(m)) => m,
@@ -86,35 +124,20 @@ pub(crate) fn fn_api_log(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn fn_api_exec(linker: &mut Linker<HostState>) -> Result<()> {
+pub fn fn_api_exec(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(API_NAMESPACE, "exec", |mut caller: Caller<'_, HostState>, req_ptr: i32, req_len: i32, out_ptr: i32, out_cap: i32| -> i32 {
         let mem: Memory = match caller.get_export("memory") {
             Some(Extern::Memory(m)) => m,
             _ => return -2,
         };
 
-        if req_ptr < 0 || req_len <= 0 || out_ptr < 0 || out_cap <= 0 {
+        let Some(req_bytes) = request_bytes(&caller, &mem, req_ptr, req_len) else {
             return -2;
-        }
-        let (req_ptr, req_len) = (req_ptr as usize, req_len as usize);
-        let (out_ptr, out_cap) = (out_ptr as usize, out_cap as usize);
-
-        // bounds check
-        let data = mem.data(&caller);
-        let req_end = match req_ptr.checked_add(req_len) {
-            Some(v) => v,
-            None => return -2,
         };
-        let out_end = match out_ptr.checked_add(out_cap) {
-            Some(v) => v,
-            None => return -2,
-        };
-        if req_end > data.len() || out_end > data.len() {
+        let Some((out_ptr, out_cap)) = output_region(&caller, &mem, out_ptr, out_cap) else {
             return -2;
-        }
+        };
 
-        // JSON
-        let req_bytes = &data[req_ptr..req_end];
         let req_str = match std::str::from_utf8(req_bytes) {
             Ok(s) => s,
             Err(_) => return -2,
@@ -129,8 +152,6 @@ pub(crate) fn fn_api_exec(linker: &mut Linker<HostState>) -> Result<()> {
             return -2;
         }
 
-        // XXX: Here should be some security checks, e.g., allowed commands, etc.
-        //      For now, we just run whatever is given. :-)
         let mut cmd = Command::new(&req.argv[0]);
         if req.argv.len() > 1 {
             cmd.args(&req.argv[1..]);
@@ -142,39 +163,31 @@ pub(crate) fn fn_api_exec(linker: &mut Linker<HostState>) -> Result<()> {
         let output = match cmd.output() {
             Ok(o) => o,
             Err(e) => {
-                // Return JSON error into out buffer
-                let resp = serde_json::json!({
-                    "exit_code": 127,
-                    "stdout": "",
-                    "stderr": e.to_string(),
-                });
-                let bytes = serde_json::to_vec(&resp).unwrap_or_else(|_| b"{}".to_vec());
-                let n = bytes.len().min(out_cap);
-                let data_mut = mem.data_mut(&mut caller);
-                data_mut[out_ptr..out_ptr + n].copy_from_slice(&bytes[..n]);
-                return n as i32;
+                return write_json(
+                    &mem,
+                    &mut caller,
+                    out_ptr,
+                    out_cap,
+                    &serde_json::json!({
+                        "exit_code": 127,
+                        "stdout": "",
+                        "stderr": e.to_string(),
+                    }),
+                );
             }
         };
 
-        let exit_code = output.status.code().unwrap_or(1);
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-        let resp = serde_json::json!({
-            "exit_code": exit_code,
-            "stdout": stdout,
-            "stderr": stderr,
-        });
-
-        let bytes = match serde_json::to_vec(&resp) {
-            Ok(b) => b,
-            Err(_) => b"{}".to_vec(),
-        };
-
-        let n = bytes.len().min(out_cap);
-        let data_mut = mem.data_mut(&mut caller);
-        data_mut[out_ptr..out_ptr + n].copy_from_slice(&bytes[..n]);
-        n as i32
+        write_json(
+            &mem,
+            &mut caller,
+            out_ptr,
+            out_cap,
+            &serde_json::json!({
+                "exit_code": output.status.code().unwrap_or(1),
+                "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
+                "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
+            }),
+        )
     })?;
 
     Ok(())

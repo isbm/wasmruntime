@@ -1,4 +1,3 @@
-use crate::apifn::HostState;
 use crate::cfg::WasmConfig;
 use anyhow::{Context, Result};
 use serde_json::Value::{self, Object};
@@ -12,6 +11,7 @@ use wasmtime_wasi::preview1::add_to_linker_async;
 
 mod apifn;
 pub mod cfg;
+pub use crate::apifn::{API_NAMESPACE, HostState, output_region, request_bytes, write_error, write_json};
 
 pub struct WasmRuntime {
     engine: Engine,
@@ -36,6 +36,13 @@ impl WasmRuntime {
         apifn::fn_api_log(&mut linker)?;
 
         Ok(Self { engine, linker, cfg: wcfg, modules: Mutex::new(HashMap::new()), logs: Arc::new(Mutex::new(Vec::new())) })
+    }
+
+    pub fn extend_linker<F>(&mut self, extend: F) -> Result<()>
+    where
+        F: FnOnce(&mut Linker<HostState>) -> Result<()>,
+    {
+        extend(&mut self.linker)
     }
 
     pub fn objects(&self) -> Result<Vec<String>> {
