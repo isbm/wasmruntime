@@ -1,0 +1,25 @@
+name: Pull Request
+
+on:
+  pull_request:
+
+jobs:
+  insanity-check:
+    name: "[In]sanity check"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run clippy
+        run: make check
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Add wasm target
+        run: rustup target add wasm32-wasip1
+      - name: Run unit tests
+        run: make test
