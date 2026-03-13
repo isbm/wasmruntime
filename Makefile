@@ -1,13 +1,11 @@
 .DEFAULT_GOAL := build
-.PHONY:build devel clean check fix
+.PHONY: build devel clean check fix test
 
 build:
 	cargo build --release --workspace
-	$(call move_bin,release,)
 
 devel:
 	cargo build -v --workspace
-	$(call move_bin,debug,)
 
 clean:
 	cargo clean
@@ -17,3 +15,6 @@ check:
 
 fix:
 	cargo clippy --fix --allow-dirty --allow-staged --all
+
+test:
+	cargo test --workspace
