@@ -126,9 +126,15 @@ impl WasmRuntime {
         Ok(module)
     }
 
+    /// Run a Wasm module with the default `{ "opts": ..., "args": ... }` stdin header.
     pub async fn run(&self, id: &str, opts: Vec<String>, args: HashMap<String, Value>, data: Vec<u8>) -> Result<Value> {
+        self.run_with_header(id, serde_json::json!({ "opts": opts, "args": args }), data).await
+    }
+
+    /// Run a Wasm module with a caller-provided JSON header on stdin.
+    pub async fn run_with_header(&self, id: &str, header: Value, data: Vec<u8>) -> Result<Value> {
         let module = self.get_or_load_module(id)?;
-        let mut input = serde_json::json!({ "opts": opts, "args": args }).to_string().into_bytes();
+        let mut input = header.to_string().into_bytes();
 
         input.push(b'\n');
         input.extend_from_slice(&data);
