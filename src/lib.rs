@@ -13,6 +13,13 @@ mod apifn;
 pub mod cfg;
 pub use crate::apifn::{API_NAMESPACE, HostState, output_region, request_bytes, write_error, write_json};
 
+#[cfg(test)]
+mod apifn_ut;
+#[cfg(test)]
+mod cfg_ut;
+#[cfg(test)]
+mod lib_ut;
+
 pub struct WasmRuntime {
     engine: Engine,
     cfg: WasmConfig,
@@ -31,9 +38,9 @@ impl WasmRuntime {
         let mut linker: Linker<HostState> = Linker::new(&engine);
         add_to_linker_async(&mut linker, |cx: &mut HostState| cx.wasi())?;
 
-        // Add helper stack
         apifn::fn_api_exec(&mut linker)?;
         apifn::fn_api_log(&mut linker)?;
+        apifn::fn_api_header(&mut linker)?;
 
         Ok(Self { engine, linker, cfg: wcfg, modules: Mutex::new(HashMap::new()), logs: Arc::new(Mutex::new(Vec::new())) })
     }
@@ -62,7 +69,6 @@ impl WasmRuntime {
         Ok(ids)
     }
 
-    /// Precompile `<id>.wasm` into `<id>.cwasm` using this host's Engine.
     pub fn precompile_module(&self, id: &str) -> Result<()> {
         let root = self.cfg.get_root_path();
         let wasm_path: PathBuf = root.join(format!("{id}.wasm"));
@@ -88,12 +94,10 @@ impl WasmRuntime {
         let root = self.cfg.get_root_path();
         let cwasm_path = root.join(format!("{id}.cwasm"));
 
-        // Precompile if .cwasm missing
         if !cwasm_path.exists() {
             self.precompile_module(id)?;
         }
 
-        // Try to load .cwasm
         let first_attempt = unsafe { Module::deserialize_file(&self.engine, &cwasm_path) };
         let module = match first_attempt {
             Ok(module) => module,
@@ -110,7 +114,6 @@ impl WasmRuntime {
                 match unsafe { Module::deserialize_file(&self.engine, &cwasm_path) } {
                     Ok(module) => module,
                     Err(err2) => {
-                        // At this point something is really wrong (FS, engine, etc.)
                         return Err(anyhow::anyhow!(
                             "Failed to deserialize precompiled module {cwasm_path:?} even \
                              after deleting and recompiling.\nFirst error:\n{err1:#}\n\n\
@@ -122,20 +125,16 @@ impl WasmRuntime {
         };
 
         self.modules.lock().unwrap().insert(id.to_string(), module.clone());
-
         Ok(module)
     }
 
-    /// Run a Wasm module with the default `{ "opts": ..., "args": ... }` stdin header.
     pub async fn run(&self, id: &str, opts: Vec<String>, args: HashMap<String, Value>, data: Vec<u8>) -> Result<Value> {
         self.run_with_header(id, serde_json::json!({ "opts": opts, "args": args }), data).await
     }
 
-    /// Run a Wasm module with a caller-provided JSON header on stdin.
     pub async fn run_with_header(&self, id: &str, header: Value, data: Vec<u8>) -> Result<Value> {
         let module = self.get_or_load_module(id)?;
         let mut input = header.to_string().into_bytes();
-
         input.push(b'\n');
         input.extend_from_slice(&data);
 
@@ -159,7 +158,7 @@ impl WasmRuntime {
         }
 
         let wasi = wb.build_p1();
-        let mut store: Store<HostState> = Store::new(&self.engine, HostState::new(wasi, self.logs.clone(), id.to_string()));
+        let mut store: Store<HostState> = Store::new(&self.engine, HostState::new(wasi, self.logs.clone(), id.to_string(), header.clone()));
 
         let instance = self.linker.instantiate_async(&mut store, &module).await?;
         let start = instance.get_typed_func::<(), ()>(&mut store, "_start").context("module missing _start")?;
